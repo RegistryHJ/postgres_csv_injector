@@ -14,37 +14,40 @@ DB_CONFIG = {
     'port': os.getenv('DB_PORT', 5432),
     'database': os.getenv('DB_NAME', 'postgres'),
     'user': os.getenv('DB_USER', 'postgres'),
-    'password': os.getenv('DB_PASSWORD', 'postgres')
+    'password': os.getenv('DB_PASSWORD', 'postgres'),
+    'schema': os.getenv('DB_SCHEMA', 'public')  # Default schema is 'public'
 }
 
+# Function to connect to PostgreSQL database and return connection
 def connect_db(config):
-  """Connect to PostgreSQL database and return connection"""
   try:
     conn = psycopg2.connect(
         host=config['host'],
         port=config['port'],
         database=config['database'],
         user=config['user'],
-        password=config['password']
+        password=config['password'],
+        client_encoding='UTF8'
     )
     return conn
   except Exception as e:
     print(f"Error connecting to database: {str(e)}")
     return None
 
-def inject_single(csv_path, table_name, conn=None):
-  """Inject a single CSV file into PostgreSQL table (JSON format)"""
+# Function to inject a single CSV file into a PostgreSQL table
+def inject_single(csv_path, table_name, schema_name='public', conn=None):
   try:
-    print("\n" + "=" * 45)
+    print("\n" + "=" * 108)
     print("Start Injection...")
-    print("-" * 45)
+    print("-" * 108)
     print(f"CSV File: {csv_path}")
+    print(f"Postgres Schema: {schema_name}")
     print(f"Postgres Table Name: {table_name}")
 
     # Check if file exists
     if not os.path.exists(csv_path):
       print(f"Error: File not found! - '{csv_path}'")
-      print("-" * 45)
+      print("-" * 108)
       return False
 
     # Use provided connection or create a new one if None
@@ -56,16 +59,20 @@ def inject_single(csv_path, table_name, conn=None):
 
     cursor = conn.cursor()
 
+    # Ensure schema exists
+    cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
+    conn.commit()
+
     # Analyze CSV Header
-    df_headers = pd.read_csv(csv_path, nrows=0)
+    df_headers = pd.read_csv(csv_path, nrows=0, dtype=str)
     headers = list(df_headers.columns)
 
     # Clean column names (PostgreSQL compatibility)
     clean_headers = []
     for header in headers:
-      clean_header = re.sub(r'[^a-zA-Z0-9_]', '_', header).lower()
-      if clean_header and clean_header[0].isdigit():
-        clean_header = 'col_' + clean_header
+      clean_header = re.sub(r'[^\w가-힣]', '_', header).lower()
+      # if clean_header and clean_header[0].isdigit():
+      #   clean_header = 'col_' + clean_header
       clean_headers.append(clean_header)
 
     # Drop existing temp table if exists
@@ -83,7 +90,7 @@ def inject_single(csv_path, table_name, conn=None):
     with tqdm(total=total_rows, desc="Loading data", ncols=100) as pbar:
       # Use chunked processing to show progress
       chunk_size = 10000
-      for chunk in pd.read_csv(csv_path, chunksize=chunk_size):
+      for chunk in pd.read_csv(csv_path, chunksize=chunk_size, dtype=str):
         # Replace column names with clean names
         chunk.columns = clean_headers
 
@@ -106,9 +113,10 @@ def inject_single(csv_path, table_name, conn=None):
         os.remove('tmp_chunk.csv')
 
     # Create JSON table
-    cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+    full_table_name = f"{schema_name}.{table_name}"
+    cursor.execute(f"DROP TABLE IF EXISTS {full_table_name}")
     create_json_table_sql = f"""
-      CREATE TABLE {table_name} (
+      CREATE TABLE {full_table_name} (
         data JSON
       )
     """
@@ -117,7 +125,7 @@ def inject_single(csv_path, table_name, conn=None):
     # Convert and insert data as JSON
     with tqdm(total=1, desc="Insert Data into Postgres", ncols=100) as pbar:
       json_convert_sql = f"""
-        INSERT INTO {table_name} (data)
+        INSERT INTO {full_table_name} (data)
         SELECT row_to_json(t)
         FROM (SELECT * FROM csv_temp) t
       """
@@ -132,21 +140,21 @@ def inject_single(csv_path, table_name, conn=None):
     if not conn_provided and conn:
       conn.close()
 
-    print("-" * 45)
+    print("-" * 108)
     print("Injection is done!")
-    print("=" * 45 + "\n")
+    print("=" * 108 + "\n")
     return True
 
   except Exception as e:
     print(f"Error: {str(e)}")
-    print("-" * 45)
+    print("-" * 108)
     # Only close connection if we created it here
     if not conn_provided and 'conn' in locals() and conn:
       conn.close()
     return False
 
-def inject_multiple(directory, table_prefix='data_', conn=None):
-  """Inject multiple CSV files from a directory into PostgreSQL tables"""
+# Function to inject multiple CSV files into PostgreSQL tables
+def inject_multiple(directory, schema_name='public', use_prefix=False, table_prefix='data_', conn=None):
   # Check if directory exists
   if not os.path.exists(directory) or not os.path.isdir(directory):
     print(f"Error: Directory not found or not a directory - {directory}")
@@ -158,12 +166,16 @@ def inject_multiple(directory, table_prefix='data_', conn=None):
     print("No CSV files found in the directory.")
     return False
 
-  print("\n" + "=" * 45)
+  print("\n" + "=" * 108)
   print("Show Information")
-  print("-" * 45)
+  print("-" * 108)
   print(f"CSV Files Directory: {directory}")
-  print(f"Postgres Table Prefix: {table_prefix}")
-  print("=" * 45)
+  print(f"Postgres Schema: {schema_name}")
+  if use_prefix:
+    print(f"Postgres Table Prefix: {table_prefix}")
+  else:
+    print("No prefix will be used for table names.")
+  print("=" * 108)
 
   # Use provided connection or create a new one if None
   conn_provided = conn is not None
@@ -178,11 +190,15 @@ def inject_multiple(directory, table_prefix='data_', conn=None):
     csv_path = os.path.join(directory, csv_file)
 
     # Create table name based on file name
-    table_name = table_prefix + os.path.splitext(csv_file)[0].lower()
+    if use_prefix:
+      table_name = table_prefix + os.path.splitext(csv_file)[0].lower()
+    else:
+      table_name = os.path.splitext(csv_file)[0].lower()
+
     table_name = re.sub(r'[^a-zA-Z0-9_]', '_', table_name)
 
     # Process file without showing individual processing message
-    success = inject_single(csv_path, table_name, conn)
+    success = inject_single(csv_path, table_name, schema_name, conn)
 
     if success:
       success_count += 1
@@ -194,37 +210,50 @@ def inject_multiple(directory, table_prefix='data_', conn=None):
   print(f"{success_count}/{len(csv_files)} files processed successfully.")
   return success_count > 0
 
+# Function to show interactive menu for CSV to PostgreSQL injection
 def show_interactive(conn=None):
-  """Show interactive menu for CSV to PostgreSQL injection"""
   # Use provided connection or create a new one if None
   conn_provided = conn is not None
   if not conn_provided:
     conn = connect_db(DB_CONFIG)
 
   while True:
-    print("\n" + "*" * 45)
-    print("*       CSV Data to Postgres Injector       *")
-    print("*" * 45)
+    print("\n" + "*" * 108)
+    print("*" + " " * 38 + "CSV Files to Postgres Injector" + " " * 38 + "*")
+    print("*" * 108)
     print("1. Inject a single CSV file")
     print("2. Inject multiple CSV files")
     print("3. Exit")
-    print("-" * 45)
+    print("-" * 108)
 
     choice = input("Choose an Option [1-3]: ")
 
     if choice == '1':
       csv_path = input("Enter the CSV File Path: ")
+      schema_name = input("Enter the Postgres Schema Name [default: public]: ")
       table_name = input("Enter the Postgres Table Name: ")
-      inject_single(csv_path, table_name, conn)
+
+      if not schema_name:
+        schema_name = 'public'
+
+      inject_single(csv_path, table_name, schema_name, conn)
 
     elif choice == '2':
       directory = input("Enter the CSV Files Directory: ")
-      table_prefix = input("Enter the Table Prefix [default: data_]: ")
+      schema_name = input("Enter the Postgres Schema Name [default: public]: ")
 
-      if not table_prefix:
-        table_prefix = 'data_'
+      if not schema_name:
+        schema_name = 'public'
 
-      inject_multiple(directory, table_prefix, conn)
+      use_prefix = input("Do you want to use a Prefix for Table Names? (y/n) [default: n]: ").lower() == 'y'
+
+      table_prefix = ''
+      if use_prefix:
+        table_prefix = input("Enter the Table Prefix [default: data_]: ")
+        if not table_prefix:
+          table_prefix = 'data_'
+
+      inject_multiple(directory, schema_name, use_prefix, table_prefix, conn)
 
     elif choice == '3':
       print("\nExiting...\n")
@@ -236,8 +265,8 @@ def show_interactive(conn=None):
     else:
       print("Invalid choice. Please try again.")
 
+# Main function to establish DB connection and start interactive mode
 def main():
-  """Main function - establish DB connection and start interactive mode"""
   # Establish a single database connection for the entire session
   conn = connect_db(DB_CONFIG)
   if conn:
